@@ -6,9 +6,9 @@
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
 #    • Sing-box 核心: 处理 UDP/QUIC 协议 (Hysteria2/TUIC) - 低内存高效率
 #  
-#  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
+#  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+TCP / VMess+WS /
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
-#           Snell v4 / Snell v5 / AnyTLS / TUIC / NaïveProxy (共14种)
+#           Snell v4 / Snell v5 / AnyTLS / TUIC / NaïveProxy (共15种)
 #  插件支持: Snell v4/v5 和 SS2022 可选启用 ShadowTLS
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
@@ -335,7 +335,7 @@ fi
 #═══════════════════════════════════════════════════════════════════════════════
 
 # 协议分类定义 (重构: Sing-box 接管独立协议)
-XRAY_PROTOCOLS="vless vless-xhttp vless-ws vmess-ws vless-vision trojan socks ss2022 ss-legacy"
+XRAY_PROTOCOLS="vless vless-xhttp vless-ws vmess vmess-ws vless-vision trojan socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="hy2 tuic"
 # 仍需独立进程的协议 (Snell 等闭源协议)
@@ -773,6 +773,20 @@ add_xray_inbound_v2() {
                 tag: "vless-xhttp"
             }' > "$tmp_inbound"
             ;;
+        vmess)
+            jq -n \
+                --argjson port "$port" \
+                --arg uuid "$uuid" \
+            '{
+                port: $port,
+                listen: "::",
+                protocol: "vmess",
+                settings: {clients: [{id: $uuid, alterId: 0, security: "auto"}]},
+                streamSettings: {network: "tcp", security: "none"},
+                sniffing: {enabled: true, destOverride: ["http","tls"]},
+                tag: "vmess-tcp"
+            }' > "$tmp_inbound"
+            ;;
         vmess-ws)
             if [[ "$has_master" == "true" ]]; then
                 jq -n \
@@ -974,7 +988,7 @@ get_protocol() {
     local installed=$(get_installed_protocols)
     if [[ -n "$installed" ]]; then
         # 优先返回 Xray 主协议
-        for proto in vless vless-vision vless-ws vless-xhttp trojan socks ss2022; do
+        for proto in vless vless-vision vless-ws vless-xhttp vmess vmess-ws trojan socks ss2022; do
             if echo "$installed" | grep -q "^$proto$"; then
                 echo "$proto"
                 return
@@ -995,6 +1009,7 @@ get_protocol_name() {
         vless-xhttp) echo "VLESS+Reality+XHTTP" ;;
         vless-vision) echo "VLESS-XTLS-Vision" ;;
         vless-ws) echo "VLESS+WS+TLS" ;;
+        vmess) echo "VMess+TCP" ;;
         vmess-ws) echo "VMess+WS" ;;
         ss2022) echo "Shadowsocks 2022" ;;
         ss-legacy) echo "Shadowsocks 传统版" ;;
@@ -1943,6 +1958,21 @@ gen_vmess_ws_link() {
     local json
     json=$(cat <<EOF
 {"v":"2","ps":"${name}","add":"${clean_ip}","port":"${port}","id":"${uuid}","aid":"0","scy":"auto","net":"ws","type":"none","host":"${sni}","path":"${path}","tls":"tls","sni":"${sni}","allowInsecure":"true"}
+EOF
+)
+    printf 'vmess://%s\n' "$(_b64_encode "$json")"
+}
+
+gen_vmess_link() {
+    local ip="$1" port="$2" uuid="$3" country="${4:-}"
+    local clean_ip="${ip#[}"
+    clean_ip="${clean_ip%]}"
+    local ip_suffix=$(get_ip_suffix "$ip")
+    local name="${country:+${country}-}VMess-TCP${ip_suffix:+-${ip_suffix}}"
+
+    local json
+    json=$(cat <<EOF
+{"v":"2","ps":"${name}","add":"${clean_ip}","port":"${port}","id":"${uuid}","aid":"0","scy":"auto","net":"tcp","type":"none","host":"","path":"","tls":""}
 EOF
 )
     printf 'vmess://%s\n' "$(_b64_encode "$json")"
@@ -3631,6 +3661,17 @@ gen_vmess_ws_server_config() {
         uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
     _save_join_info "vmess-ws" "VMESSWS|%s|$outer_port|$uuid|$sni|$path" \
         "gen_vmess_ws_link %s $outer_port $uuid $sni $path"
+    echo "server" > "$CFG/role"
+}
+
+# VMess+TCP 服务端配置
+gen_vmess_server_config() {
+    local uuid="$1" port="$2"
+    mkdir -p "$CFG"
+
+    register_protocol "vmess" "$(build_config uuid "$uuid" port "$port")"
+    _save_join_info "vmess" "VMESS|%s|$port|$uuid" \
+        "gen_vmess_link %s $port $uuid"
     echo "server" > "$CFG/role"
 }
 
@@ -6570,7 +6611,7 @@ _ensure_import_dependencies() {
     # Xray 协议检测
     for proto in $xray_protos; do
         case "$proto" in
-            vless|vless-xhttp|vless-ws|vmess-ws|vless-vision|trojan|socks|ss2022|ss-legacy)
+            vless|vless-xhttp|vless-ws|vmess|vmess-ws|vless-vision|trojan|socks|ss2022|ss-legacy)
                 need_xray=true
                 ;;
         esac
@@ -6881,6 +6922,10 @@ _regenerate_all_join_files() {
                 local outer_port=$(_get_master_port "$port")
                 _save_join_info "vless-ws" "VLESS-WS|%s|$outer_port|$uuid|$sni|$path" \
                     "gen_vless_ws_link %s $outer_port $uuid $sni $path $country"
+                ;;
+            vmess)
+                _save_join_info "vmess" "VMESS|%s|$port|$uuid" \
+                    "gen_vmess_link %s $port $uuid $country"
                 ;;
             vmess-ws)
                 local outer_port=$(_get_master_port "$port")
@@ -7252,18 +7297,6 @@ auto_update_ip() {
     _ok "IP 地址更新完成"
     echo ""
     _warn "请重启服务使配置生效"
-}
-
-# 重新生成所有 JOIN 文件
-_regenerate_all_join_files() {
-    local protocols=$(get_installed_protocols)
-    for proto in $protocols; do
-        # 调用对应协议的 JOIN 生成函数 (如果存在)
-        local gen_func="gen_${proto//-/_}_join"
-        if type "$gen_func" &>/dev/null; then
-            $gen_func 2>/dev/null
-        fi
-    done
 }
 
 # 配置管理主菜单
@@ -8820,6 +8853,17 @@ show_single_protocol_info() {
             echo -e "  ${Y}Loon 配置:${NC}"
             echo -e "  ${C}${country_code}-Vless-WS = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
             ;;
+        vmess)
+            echo -e "  UUID: ${G}$uuid${NC}"
+            echo -e "  传输: ${G}tcp${NC}"
+            echo -e "  TLS: ${G}关闭${NC}"
+            echo ""
+            echo -e "  ${Y}Surge 配置:${NC}"
+            echo -e "  ${C}${country_code}-VMess-TCP = vmess, ${config_ip}, ${display_port}, ${uuid}, tls=false${NC}"
+            echo ""
+            echo -e "  ${Y}Loon 配置:${NC}"
+            echo -e "  ${C}${country_code}-VMess-TCP = VMess, ${config_ip}, ${display_port}, aes-128-gcm, \"${uuid}\", transport=tcp, udp=true${NC}"
+            ;;
         vmess-ws)
             echo -e "  UUID: ${G}$uuid${NC}"
             echo -e "  SNI: ${G}$sni${NC}"
@@ -8986,6 +9030,10 @@ show_single_protocol_info() {
             vless-ws)
                 link=$(gen_vless_ws_link "$ip_addr" "$link_port" "$uuid" "$sni" "$path" "$country_code")
                 join_code=$(_b64_encode "VLESS-WS|${ip_addr}|${link_port}|${uuid}|${sni}|${path}")
+                ;;
+            vmess)
+                link=$(gen_vmess_link "$ip_addr" "$link_port" "$uuid" "$country_code")
+                join_code=$(_b64_encode "VMESS|${ip_addr}|${link_port}|${uuid}")
                 ;;
             vmess-ws)
                 link=$(gen_vmess_ws_link "$ip_addr" "$link_port" "$uuid" "$sni" "$path" "$country_code")
@@ -9648,44 +9696,46 @@ select_protocol() {
     _item "1" "VLESS + Reality ${D}(推荐, 抗封锁)${NC}"
     _item "2" "VLESS + Reality + XHTTP ${D}(多路复用)${NC}"
     _item "3" "VLESS + WS + TLS ${D}(CDN友好, 可作回落)${NC}"
-    _item "4" "VMess + WS ${D}(回落分流/免流)${NC}"
-    _item "5" "VLESS-XTLS-Vision ${D}(支持回落)${NC}"
-    _item "6" "Trojan ${D}(支持回落)${NC}"
-    _item "7" "Hysteria2 ${D}(UDP高速)${NC}"
-    _item "8" "Shadowsocks"
-    _item "9" "SOCKS5"
+    _item "4" "VMess + TCP ${D}(普通 TCP, 兼容性好)${NC}"
+    _item "5" "VMess + WS ${D}(回落分流/免流)${NC}"
+    _item "6" "VLESS-XTLS-Vision ${D}(支持回落)${NC}"
+    _item "7" "Trojan ${D}(支持回落)${NC}"
+    _item "8" "Hysteria2 ${D}(UDP高速)${NC}"
+    _item "9" "Shadowsocks"
+    _item "10" "SOCKS5"
     _line
     echo -e "  ${W}Surge 专属${NC}"
     _line
-    _item "10" "Snell v4"
-    _item "11" "Snell v5"
+    _item "11" "Snell v4"
+    _item "12" "Snell v5"
     _line
     echo -e "  ${W}其他协议${NC}"
     _line
-    _item "12" "AnyTLS"
-    _item "13" "TUIC v5"
-    _item "14" "NaïveProxy"
+    _item "13" "AnyTLS"
+    _item "14" "TUIC v5"
+    _item "15" "NaïveProxy"
     echo ""
-    echo -e "  ${D}提示: 5/6 占用443端口，3/4 可作为回落共用${NC}"
+    echo -e "  ${D}提示: 6/7 占用443端口，3/5 可作为回落共用${NC}"
     echo ""
     
     while true; do
-        read -rp "  选择协议 [1-14]: " choice
+        read -rp "  选择协议 [1-15]: " choice
         case $choice in
             1) SELECTED_PROTOCOL="vless"; break ;;
             2) SELECTED_PROTOCOL="vless-xhttp"; break ;;
             3) SELECTED_PROTOCOL="vless-ws"; break ;;
-            4) SELECTED_PROTOCOL="vmess-ws"; break ;;
-            5) SELECTED_PROTOCOL="vless-vision"; break ;;
-            6) SELECTED_PROTOCOL="trojan"; break ;;
-            7) SELECTED_PROTOCOL="hy2"; break ;;
-            8) select_ss_version; break ;;
-            9) SELECTED_PROTOCOL="socks"; break ;;
-            10) SELECTED_PROTOCOL="snell"; break ;;
-            11) SELECTED_PROTOCOL="snell-v5"; break ;;
-            12) SELECTED_PROTOCOL="anytls"; break ;;
-            13) SELECTED_PROTOCOL="tuic"; break ;;
-            14) SELECTED_PROTOCOL="naive"; break ;;
+            4) SELECTED_PROTOCOL="vmess"; break ;;
+            5) SELECTED_PROTOCOL="vmess-ws"; break ;;
+            6) SELECTED_PROTOCOL="vless-vision"; break ;;
+            7) SELECTED_PROTOCOL="trojan"; break ;;
+            8) SELECTED_PROTOCOL="hy2"; break ;;
+            9) select_ss_version; break ;;
+            10) SELECTED_PROTOCOL="socks"; break ;;
+            11) SELECTED_PROTOCOL="snell"; break ;;
+            12) SELECTED_PROTOCOL="snell-v5"; break ;;
+            13) SELECTED_PROTOCOL="anytls"; break ;;
+            14) SELECTED_PROTOCOL="tuic"; break ;;
+            15) SELECTED_PROTOCOL="naive"; break ;;
             *) _err "无效选择" ;;
         esac
     done
@@ -9909,7 +9959,7 @@ do_install_server() {
     
     # 根据协议安装对应软件
     case "$protocol" in
-        vless|vless-xhttp|vless-ws|vless-vision|ss2022|ss-legacy|trojan)
+        vless|vless-xhttp|vless-ws|vmess|vmess-ws|vless-vision|ss2022|ss-legacy|trojan)
             install_xray || return
             ;;
         hy2|tuic)
@@ -10064,6 +10114,25 @@ do_install_server() {
             
             _info "生成配置..."
             gen_vless_ws_server_config "$uuid" "$port" "$final_sni" "$path"
+            ;;
+        vmess)
+            local uuid=$(gen_uuid)
+
+            echo ""
+            _line
+            echo -e "  ${C}VMess + TCP 配置${NC}"
+            _line
+            echo -e "  端口: ${G}$port${NC}"
+            echo -e "  UUID: ${G}$uuid${NC}"
+            echo -e "  传输: ${G}tcp${NC}"
+            echo -e "  TLS: ${G}关闭${NC}"
+            _line
+            echo ""
+            read -rp "  确认安装? [Y/n]: " confirm
+            [[ "$confirm" =~ ^[nN]$ ]] && return
+
+            _info "生成配置..."
+            gen_vmess_server_config "$uuid" "$port"
             ;;
         vmess-ws)
             local uuid=$(gen_uuid)
@@ -12121,6 +12190,9 @@ gen_v2ray_sub() {
             vless-vision)
                 [[ -n "$server_ip" ]] && link=$(gen_vless_vision_link "$server_ip" "$actual_port" "$uuid" "$sni" "$country_code")
                 ;;
+            vmess)
+                [[ -n "$server_ip" ]] && link=$(gen_vmess_link "$server_ip" "$actual_port" "$uuid" "$country_code")
+                ;;
             vmess-ws)
                 [[ -n "$server_ip" ]] && link=$(gen_vmess_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
                 ;;
@@ -12283,6 +12355,18 @@ gen_clash_sub() {
     skip-cert-verify: true
     servername: $sni
     client-fingerprint: chrome"
+                ;;
+            vmess)
+                [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
+    type: vmess
+    server: \"$server_ip\"
+    port: $actual_port
+    uuid: $uuid
+    alterId: 0
+    cipher: auto
+    network: tcp
+    tls: false
+    udp: true"
                 ;;
             vmess-ws)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
@@ -12450,6 +12534,7 @@ gen_surge_sub() {
         local port=$(echo "$cfg" | jq -r '.port // empty')
         local sni=$(echo "$cfg" | jq -r '.sni // empty')
         local password=$(echo "$cfg" | jq -r '.password // empty')
+        local username=$(echo "$cfg" | jq -r '.username // empty')
         local method=$(echo "$cfg" | jq -r '.method // empty')
         local psk=$(echo "$cfg" | jq -r '.psk // empty')
         local version=$(echo "$cfg" | jq -r '.version // empty')
@@ -12458,6 +12543,9 @@ gen_surge_sub() {
         local proxy=""
         
         case "$protocol" in
+            vmess)
+                [[ -n "$server_ip" ]] && proxy="$name = vmess, $server_ip, $port, $uuid, tls=false"
+                ;;
             trojan)
                 [[ -n "$server_ip" ]] && proxy="$name = trojan, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
                 ;;
