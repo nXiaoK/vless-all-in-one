@@ -1153,36 +1153,57 @@ cleanup_hy2_nat_rules() {
 }
 
 sync_time() {
-    _info "同步系统时间..."
-    
-    # 方法1: 使用HTTP获取时间 (最快最可靠)
-    local http_time=$(timeout 5 curl -sI --connect-timeout 3 --max-time 5 http://www.baidu.com 2>/dev/null | grep -i "^date:" | cut -d' ' -f2-)
-    if [[ -n "$http_time" ]]; then
-        if date -s "$http_time" &>/dev/null; then
-            _ok "时间同步完成 (HTTP)"
+    _info "设置北京时间并同步系统时间..."
+
+    if [[ -f /usr/share/zoneinfo/Asia/Shanghai ]]; then
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null || true
+        echo "Asia/Shanghai" > /etc/timezone 2>/dev/null || true
+        command -v timedatectl &>/dev/null && timedatectl set-timezone Asia/Shanghai &>/dev/null || true
+        _ok "时区已设置为 Asia/Shanghai (北京时间)"
+    else
+        _warn "未找到 Asia/Shanghai 时区文件，跳过时区设置"
+    fi
+
+    # 方法1: 使用 NTP 服务/客户端同步 UTC 时间，时区只影响显示。
+    if command -v chronyd &>/dev/null; then
+        if timeout 10 chronyd -q 'server ntp.aliyun.com iburst' &>/dev/null || timeout 10 chronyd -q 'pool pool.ntp.org iburst' &>/dev/null; then
+            _ok "时间同步完成 (chrony)"
+            date '+  当前北京时间: %F %T %Z'
             return 0
         fi
     fi
-    
-    # 方法2: 使用ntpdate (如果可用)
+
     if command -v ntpdate &>/dev/null; then
-        if timeout 5 ntpdate -s pool.ntp.org &>/dev/null; then
+        if timeout 10 ntpdate -u ntp.aliyun.com &>/dev/null || timeout 10 ntpdate -u pool.ntp.org &>/dev/null; then
             _ok "时间同步完成 (NTP)"
+            date '+  当前北京时间: %F %T %Z'
             return 0
         fi
     fi
-    
-    # 方法3: 使用timedatectl (systemd系统)
+
+    # 方法2: 使用 HTTP Date 头兜底。
+    local http_time
+    http_time=$(timeout 8 curl -sI --connect-timeout 3 --max-time 8 https://www.baidu.com 2>/dev/null | awk 'tolower($1)=="date:" {$1=""; sub(/^ /,""); print; exit}')
+    [[ -z "$http_time" ]] && http_time=$(timeout 8 curl -sI --connect-timeout 3 --max-time 8 https://www.cloudflare.com 2>/dev/null | awk 'tolower($1)=="date:" {$1=""; sub(/^ /,""); print; exit}')
+    if [[ -n "$http_time" ]] && date -s "$http_time" &>/dev/null; then
+        _ok "时间同步完成 (HTTP Date)"
+        date '+  当前北京时间: %F %T %Z'
+        return 0
+    fi
+
+    # 方法3: systemd-timesyncd 兜底，等待几秒让状态刷新。
     if command -v timedatectl &>/dev/null; then
-        if timeout 5 timedatectl set-ntp true &>/dev/null; then
-            _ok "时间同步完成 (systemd)"
+        timedatectl set-ntp true &>/dev/null || true
+        sleep 3
+        if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+            _ok "时间同步完成 (systemd-timesyncd)"
+            date '+  当前北京时间: %F %T %Z'
             return 0
         fi
     fi
-    
-    # 如果所有方法都失败，跳过时间同步
-    _warn "时间同步失败，继续安装..."
-    return 0
+
+    _err "时间同步失败，SS2022 对时间敏感，已中止安装"
+    return 1
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -2206,7 +2227,7 @@ install_deps() {
             fi
         fi
         
-        local deps="curl jq unzip iproute2 iptables ip6tables gcompat libc6-compat openssl socat bind-tools"
+        local deps="curl jq unzip iproute2 iptables ip6tables gcompat libc6-compat openssl socat bind-tools tzdata chrony"
         _info "安装依赖: $deps"
         if ! timeout 180 apk add --no-cache $deps 2>&1 | grep -E '^(\(|OK|Installing|Executing)' | sed 's/^/  /'; then
             # 检查实际安装结果
@@ -2229,7 +2250,7 @@ install_deps() {
             fi
         fi
         
-        local deps="curl jq unzip iproute iptables vim-common openssl socat bind-utils"
+        local deps="curl jq unzip iproute iptables vim-common openssl socat bind-utils tzdata chrony"
         _info "安装依赖: $deps"
         if ! timeout 300 yum install -y $deps 2>&1 | grep -E '^(Installing|Verifying|Complete|Downloading)' | sed 's/^/  /'; then
             # 检查实际安装结果
@@ -2251,7 +2272,7 @@ install_deps() {
             :
         fi
         
-        local deps="curl jq unzip iproute2 xxd openssl socat dnsutils"
+        local deps="curl jq unzip iproute2 xxd openssl socat dnsutils tzdata chrony"
         _info "安装依赖: $deps"
         # 使用 DEBIAN_FRONTEND 避免交互，显示简化进度，移除 timeout 避免死锁
         if ! DEBIAN_FRONTEND=noninteractive apt-get install -y $deps 2>&1 | grep -E '^(Setting up|Unpacking|Processing|Get:|Fetched)' | sed 's/^/  /'; then
@@ -9956,14 +9977,17 @@ do_install_server() {
         fi
     fi
     
-    # 只有 SS2022 需要时间同步
-    if [[ "$protocol" == "ss2022" || "$protocol" == "ss2022-shadowtls" ]]; then
-        sync_time
-    fi
-
     # 检测并安装基础依赖
     _info "检测基础依赖..."
     check_dependencies || { _err "依赖检测失败"; return 1; }
+
+    local deps_ready=false
+    # SS2022 对时间敏感，先确保 tzdata/chrony 等完整依赖可用，再设置北京时间并同步系统时间
+    if [[ "$protocol" == "ss2022" || "$protocol" == "ss2022-shadowtls" ]]; then
+        install_deps || return
+        deps_ready=true
+        sync_time || return 1
+    fi
 
     _info "检测网络环境..."
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
@@ -10037,7 +10061,7 @@ do_install_server() {
         fi
     fi
 
-    install_deps || return
+    [[ "$deps_ready" == "true" ]] || install_deps || return
     
     # 根据协议安装对应软件
     case "$protocol" in
