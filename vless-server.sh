@@ -200,7 +200,7 @@ _save_join_info() {
         ipfmt=$ip; [[ "$label" == V6 ]] && ipfmt="[$ip]"
 
         data=${data_fmt//%s/$ipfmt}; data=${data//%b/$ipfmt}
-        code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
+        code=$(_b64_encode "$data")
         cmd=${link_cmd//%s/$ipfmt}; cmd=${cmd//%b/$ipfmt}
         link=$(eval "$cmd")
 
@@ -920,6 +920,44 @@ urldecode() {
     local encoded="$1"
     # 使用 printf 解码 %XX 格式
     printf '%b' "${encoded//%/\\x}"
+}
+
+_b64_encode() {
+    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+_b64_urlsafe_encode() {
+    _b64_encode "$1" | tr '+/' '-_' | tr -d '='
+}
+
+_b64_decode() {
+    local input="$1"
+    input="${input//-/+}"
+    input="${input//_/\/}"
+    case $((${#input} % 4)) in
+        2) input="${input}==" ;;
+        3) input="${input}=" ;;
+    esac
+    printf '%s' "$input" | base64 -d 2>/dev/null
+}
+
+_uri_host() {
+    local host="$1"
+    host="${host#[}"
+    host="${host%]}"
+    [[ "$host" == *:* ]] && printf '[%s]' "$host" || printf '%s' "$host"
+}
+
+_split_host_port() {
+    local hostport="$1"
+    if [[ "$hostport" == \[*\]:* ]]; then
+        _PARSED_HOST="${hostport%%]:*}"
+        _PARSED_HOST="${_PARSED_HOST#[}"
+        _PARSED_PORT="${hostport##*]:}"
+    else
+        _PARSED_HOST="${hostport%:*}"
+        _PARSED_PORT="${hostport##*:}"
+    fi
 }
 
 _header() {
@@ -1837,7 +1875,15 @@ gen_xhttp_path() {
     fi
     echo "$path"
 }
-gen_password() { head -c 16 /dev/urandom 2>/dev/null | base64 | tr -d '/+=' | head -c 16 || printf '%s%s' $RANDOM $RANDOM | md5sum | head -c 16; }
+gen_password() {
+    local len="${1:-16}"
+    local raw
+    raw=$(head -c 64 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '/+=' | head -c "$len")
+    if [[ -z "$raw" ]]; then
+        raw=$(printf '%s%s%s' "$RANDOM" "$RANDOM" "$(date +%s%N 2>/dev/null)" | md5sum 2>/dev/null | awk '{print $1}' | head -c "$len")
+    fi
+    printf '%s' "$raw"
+}
 
 urlencode() {
     local s="$1" i c o=""
@@ -1845,7 +1891,7 @@ urlencode() {
         c="${s:i:1}"
         case "$c" in
             [-_.~a-zA-Z0-9]) o+="$c" ;;
-            *) printf -v c '%%%02x' "'$c"; o+="$c" ;;
+            *) printf -v c '%%%02x' "'$c" || true; o+="$c" ;;
         esac
     done
     echo "$o"
@@ -1899,7 +1945,7 @@ gen_vmess_ws_link() {
 {"v":"2","ps":"${name}","add":"${clean_ip}","port":"${port}","id":"${uuid}","aid":"0","scy":"auto","net":"ws","type":"none","host":"${sni}","path":"${path}","tls":"tls","sni":"${sni}","allowInsecure":"true"}
 EOF
 )
-    printf 'vmess://%s\n' "$(echo -n "$json" | base64 -w 0 2>/dev/null || echo -n "$json" | base64 | tr -d '\n')"
+    printf 'vmess://%s\n' "$(_b64_encode "$json")"
 }
 
 gen_qr() { printf '%s\n' "https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=$(urlencode "$1")"; }
@@ -1938,18 +1984,20 @@ gen_vless_vision_link() {
 
 gen_ss2022_link() {
     local ip="$1" port="$2" method="$3" password="$4" country="${5:-}"
+    local host=$(_uri_host "$ip")
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}SS2022${ip_suffix:+-${ip_suffix}}"
-    local userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
-    printf '%s\n' "ss://${userinfo}@${ip}:${port}#${name}"
+    local userinfo=$(_b64_urlsafe_encode "${method}:${password}")
+    printf '%s\n' "ss://${userinfo}@${host}:${port}#$(urlencode "$name")"
 }
 
 gen_ss_legacy_link() {
     local ip="$1" port="$2" method="$3" password="$4" country="${5:-}"
+    local host=$(_uri_host "$ip")
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}SS${ip_suffix:+-${ip_suffix}}"
-    local userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
-    printf '%s\n' "ss://${userinfo}@${ip}:${port}#${name}"
+    local userinfo=$(_b64_urlsafe_encode "${method}:${password}")
+    printf '%s\n' "ss://${userinfo}@${host}:${port}#$(urlencode "$name")"
 }
 
 gen_snell_link() {
@@ -1986,7 +2034,7 @@ gen_shadowtls_link() {
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}ShadowTLS${ip_suffix:+-${ip_suffix}}"
     # ShadowTLS链接格式：ss://method:password@server:port#name + ShadowTLS参数
-    local ss_link=$(echo -n "${method}:${password}" | base64 -w 0)
+    local ss_link=$(_b64_urlsafe_encode "${method}:${password}")
     printf '%s\n' "ss://${ss_link}@${ip}:${port}?plugin=shadow-tls;host=${sni};password=${stls_password}#${name}"
 }
 
@@ -1999,12 +2047,24 @@ gen_snell_v5_link() {
 
 gen_socks_link() {
     local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
+    local host=$(_uri_host "$ip")
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}SOCKS5${ip_suffix:+-${ip_suffix}}"
     if [[ -n "$username" && -n "$password" ]]; then
-        printf '%s\n' "https://t.me/socks?server=${ip}&port=${port}&user=${username}&pass=${password}"
+        printf '%s\n' "socks5://$(urlencode "$username"):$(urlencode "$password")@${host}:${port}#$(urlencode "$name")"
     else
-        printf '%s\n' "socks5://${ip}:${port}#${name}"
+        printf '%s\n' "socks5://${host}:${port}#$(urlencode "$name")"
+    fi
+}
+
+gen_tg_socks_link() {
+    local ip="$1" port="$2" username="$3" password="$4"
+    local host="${ip#[}"
+    host="${host%]}"
+    if [[ -n "$username" && -n "$password" ]]; then
+        printf '%s\n' "https://t.me/socks?server=$(urlencode "$host")&port=${port}&user=$(urlencode "$username")&pass=$(urlencode "$password")"
+    else
+        printf '%s\n' "https://t.me/socks?server=$(urlencode "$host")&port=${port}"
     fi
 }
 
@@ -3816,20 +3876,18 @@ EOF
 }
 
 # SOCKS5 服务端配置
-gen_socks_server_config() {
+_save_socks_join_info() {
     local username="$1" password="$2" port="$3"
     mkdir -p "$CFG"
 
-    register_protocol "socks" "$(build_config username "$username" password "$password" port "$port")"
-    
     # SOCKS5 的 join 信息比较特殊，需要两种链接格式
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
     > "$CFG/socks.join"
     if [[ -n "$ipv4" ]]; then
         local data="SOCKS|$ipv4|$port|$username|$password"
-        local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        local tg_link=$(gen_socks_link "$ipv4" "$port" "$username" "$password")
-        local socks_link="socks5://${username}:${password}@${ipv4}:${port}#SOCKS5-${ipv4}"
+        local code=$(_b64_encode "$data")
+        local tg_link=$(gen_tg_socks_link "$ipv4" "$port" "$username" "$password")
+        local socks_link=$(gen_socks_link "$ipv4" "$port" "$username" "$password")
         printf '%s\n' "# IPv4" >> "$CFG/socks.join"
         printf '%s\n' "JOIN_V4=$code" >> "$CFG/socks.join"
         printf '%s\n' "SOCKS_V4=$tg_link" >> "$CFG/socks.join"
@@ -3837,14 +3895,22 @@ gen_socks_server_config() {
     fi
     if [[ -n "$ipv6" ]]; then
         local data="SOCKS|[$ipv6]|$port|$username|$password"
-        local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        local tg_link="https://t.me/socks?server=[$ipv6]&port=${port}&user=${username}&pass=${password}"
-        local socks_link="socks5://${username}:${password}@[$ipv6]:${port}#SOCKS5-[$ipv6]"
+        local code=$(_b64_encode "$data")
+        local tg_link=$(gen_tg_socks_link "$ipv6" "$port" "$username" "$password")
+        local socks_link=$(gen_socks_link "$ipv6" "$port" "$username" "$password")
         printf '%s\n' "# IPv6" >> "$CFG/socks.join"
         printf '%s\n' "JOIN_V6=$code" >> "$CFG/socks.join"
         printf '%s\n' "SOCKS_V6=$tg_link" >> "$CFG/socks.join"
         printf '%s\n' "SOCKS5_V6=$socks_link" >> "$CFG/socks.join"
     fi
+}
+
+gen_socks_server_config() {
+    local username="$1" password="$2" port="$3"
+    mkdir -p "$CFG"
+
+    register_protocol "socks" "$(build_config username "$username" password "$password" port "$port")"
+    _save_socks_join_info "$username" "$password" "$port"
     echo "server" > "$CFG/role"
 }
 
@@ -6799,6 +6865,7 @@ _regenerate_all_join_files() {
         local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
         local path=$(echo "$cfg" | jq -r '.path // empty')
         local password=$(echo "$cfg" | jq -r '.password // empty')
+        local username=$(echo "$cfg" | jq -r '.username // empty')
         local method=$(echo "$cfg" | jq -r '.method // empty')
         
         case "$proto" in
@@ -6831,6 +6898,13 @@ _regenerate_all_join_files() {
             ss2022)
                 _save_join_info "ss2022" "SS2022|%s|$port|$method|$password" \
                     "gen_ss2022_link %s $port $method $password $country"
+                ;;
+            ss-legacy)
+                _save_join_info "ss-legacy" "SS|%s|$port|$method|$password" \
+                    "gen_ss_legacy_link %s $port $method $password $country"
+                ;;
+            socks)
+                _save_socks_join_info "$username" "$password" "$port"
                 ;;
         esac
     done
@@ -7571,30 +7645,36 @@ parse_proxy_link() {
     
     case "$link" in
         ss://*)
-            # SS 格式: ss://base64(method:password)@host:port#name 或 ss://base64#name
+            # SS 格式: ss://base64(method:password)@host:port#name / ss://method:password@host:port#name / ss://base64#name
             local encoded="${link#ss://}"
             local name="" host="" port="" method="" password=""
             
             # 提取名称
             [[ "$encoded" == *"#"* ]] && { name=$(urldecode "$(echo "$encoded" | sed 's/.*#//')"); encoded="${encoded%%#*}"; }
+            encoded="${encoded%%\?*}"
             
             # 新格式: base64(method:password)@host:port
             if [[ "$encoded" == *"@"* ]]; then
                 local userinfo="${encoded%%@*}"
                 local hostport="${encoded#*@}"
                 # 解码 userinfo
-                local decoded=$(echo "$userinfo" | base64 -d 2>/dev/null)
+                local decoded=$(_b64_decode "$userinfo")
+                [[ -z "$decoded" && "$userinfo" == *":"* ]] && decoded="$userinfo"
                 method="${decoded%%:*}"
                 password="${decoded#*:}"
-                host="${hostport%%:*}"
-                port="${hostport##*:}"
+                _split_host_port "$hostport"
+                host="$_PARSED_HOST"
+                port="$_PARSED_PORT"
             else
                 # 旧格式: 整体 base64
-                local decoded=$(echo "$encoded" | base64 -d 2>/dev/null)
-                method=$(echo "$decoded" | cut -d: -f1)
-                password=$(echo "$decoded" | cut -d: -f2 | cut -d@ -f1)
-                host=$(echo "$decoded" | cut -d@ -f2 | cut -d: -f1)
-                port=$(echo "$decoded" | cut -d: -f3)
+                local decoded=$(_b64_decode "$encoded")
+                local method_pass="${decoded%%@*}"
+                method="${method_pass%%:*}"
+                password="${method_pass#*:}"
+                local hostport="${decoded#*@}"
+                _split_host_port "$hostport"
+                host="$_PARSED_HOST"
+                port="$_PARSED_PORT"
             fi
             
             # 确保 port 是纯数字
@@ -8893,74 +8973,74 @@ show_single_protocol_info() {
         case "$protocol" in
             vless)
                 link=$(gen_vless_link "$ip_addr" "$link_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
-                join_code=$(echo "REALITY|${ip_addr}|${link_port}|${uuid}|${public_key}|${short_id}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "REALITY|${ip_addr}|${link_port}|${uuid}|${public_key}|${short_id}|${sni}")
                 ;;
             vless-xhttp)
                 link=$(gen_vless_xhttp_link "$ip_addr" "$link_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code")
-                join_code=$(echo "REALITY-XHTTP|${ip_addr}|${link_port}|${uuid}|${public_key}|${short_id}|${sni}|${path}" | base64 -w 0)
+                join_code=$(_b64_encode "REALITY-XHTTP|${ip_addr}|${link_port}|${uuid}|${public_key}|${short_id}|${sni}|${path}")
                 ;;
             vless-vision)
                 link=$(gen_vless_vision_link "$ip_addr" "$link_port" "$uuid" "$sni" "$country_code")
-                join_code=$(echo "VLESS-VISION|${ip_addr}|${link_port}|${uuid}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "VLESS-VISION|${ip_addr}|${link_port}|${uuid}|${sni}")
                 ;;
             vless-ws)
                 link=$(gen_vless_ws_link "$ip_addr" "$link_port" "$uuid" "$sni" "$path" "$country_code")
-                join_code=$(echo "VLESS-WS|${ip_addr}|${link_port}|${uuid}|${sni}|${path}" | base64 -w 0)
+                join_code=$(_b64_encode "VLESS-WS|${ip_addr}|${link_port}|${uuid}|${sni}|${path}")
                 ;;
             vmess-ws)
                 link=$(gen_vmess_ws_link "$ip_addr" "$link_port" "$uuid" "$sni" "$path" "$country_code")
-                join_code=$(echo "VMESS-WS|${ip_addr}|${link_port}|${uuid}|${sni}|${path}" | base64 -w 0)
+                join_code=$(_b64_encode "VMESS-WS|${ip_addr}|${link_port}|${uuid}|${sni}|${path}")
                 ;;
             ss2022)
                 link=$(gen_ss2022_link "$ip_addr" "$link_port" "$method" "$password" "$country_code")
-                join_code=$(echo "SS2022|${ip_addr}|${link_port}|${method}|${password}" | base64 -w 0)
+                join_code=$(_b64_encode "SS2022|${ip_addr}|${link_port}|${method}|${password}")
                 ;;
             ss-legacy)
                 link=$(gen_ss_legacy_link "$ip_addr" "$link_port" "$method" "$password" "$country_code")
-                join_code=$(echo "SS|${ip_addr}|${link_port}|${method}|${password}" | base64 -w 0)
+                join_code=$(_b64_encode "SS|${ip_addr}|${link_port}|${method}|${password}")
                 ;;
             hy2)
                 link=$(gen_hy2_link "$ip_addr" "$link_port" "$password" "$sni" "$country_code")
-                join_code=$(echo "HY2|${ip_addr}|${link_port}|${password}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "HY2|${ip_addr}|${link_port}|${password}|${sni}")
                 ;;
             trojan)
                 link=$(gen_trojan_link "$ip_addr" "$link_port" "$password" "$sni" "$country_code")
-                join_code=$(echo "TROJAN|${ip_addr}|${link_port}|${password}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "TROJAN|${ip_addr}|${link_port}|${password}|${sni}")
                 ;;
             snell)
                 link=$(gen_snell_link "$ip_addr" "$link_port" "$psk" "$version" "$country_code")
-                join_code=$(echo "SNELL|${ip_addr}|${link_port}|${psk}|${version}" | base64 -w 0)
+                join_code=$(_b64_encode "SNELL|${ip_addr}|${link_port}|${psk}|${version}")
                 ;;
             snell-v5)
                 link=$(gen_snell_v5_link "$ip_addr" "$link_port" "$psk" "$version" "$country_code")
-                join_code=$(echo "SNELL-V5|${ip_addr}|${link_port}|${psk}|${version}" | base64 -w 0)
+                join_code=$(_b64_encode "SNELL-V5|${ip_addr}|${link_port}|${psk}|${version}")
                 ;;
             snell-shadowtls|snell-v5-shadowtls)
                 local stls_ver="${version:-4}"
                 [[ "$protocol" == "snell-v5-shadowtls" ]] && stls_ver="5"
-                join_code=$(echo "SNELL-SHADOWTLS|${ip_addr}|${link_port}|${psk}|${stls_ver}|${stls_password}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "SNELL-SHADOWTLS|${ip_addr}|${link_port}|${psk}|${stls_ver}|${stls_password}|${sni}")
                 link=""
                 ;;
             ss2022-shadowtls)
-                join_code=$(echo "SS2022-SHADOWTLS|${ip_addr}|${link_port}|${method}|${password}|${stls_password}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "SS2022-SHADOWTLS|${ip_addr}|${link_port}|${method}|${password}|${stls_password}|${sni}")
                 link=""
                 ;;
             tuic)
                 link=$(gen_tuic_link "$ip_addr" "$link_port" "$uuid" "$password" "$sni" "$country_code")
-                join_code=$(echo "TUIC|${ip_addr}|${link_port}|${uuid}|${password}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "TUIC|${ip_addr}|${link_port}|${uuid}|${password}|${sni}")
                 ;;
             anytls)
                 link=$(gen_anytls_link "$ip_addr" "$link_port" "$password" "$sni" "$country_code")
-                join_code=$(echo "ANYTLS|${ip_addr}|${link_port}|${password}|${sni}" | base64 -w 0)
+                join_code=$(_b64_encode "ANYTLS|${ip_addr}|${link_port}|${password}|${sni}")
                 ;;
             naive)
                 local domain=$(echo "$cfg" | jq -r '.domain // empty')
                 link=$(gen_naive_link "$domain" "$link_port" "$username" "$password" "$country_code")
-                join_code=$(echo "NAIVE|${domain}|${link_port}|${username}|${password}" | base64 -w 0)
+                join_code=$(_b64_encode "NAIVE|${domain}|${link_port}|${username}|${password}")
                 ;;
             socks)
                 link=$(gen_socks_link "$ip_addr" "$link_port" "$username" "$password" "$country_code")
-                join_code=$(echo "SOCKS|${ip_addr}|${link_port}|${username}|${password}" | base64 -w 0)
+                join_code=$(_b64_encode "SOCKS|${ip_addr}|${link_port}|${username}|${password}")
                 ;;
         esac
         
@@ -8974,9 +9054,13 @@ show_single_protocol_info() {
         # ShadowTLS 组合协议只显示 JOIN 码
         if [[ "$protocol" != "snell-shadowtls" && "$protocol" != "snell-v5-shadowtls" && "$protocol" != "ss2022-shadowtls" ]]; then
             if [[ "$protocol" == "socks" ]]; then
-                local socks_link="socks5://${username}:${password}@${ip_addr}:${link_port}#SOCKS5-${ip_addr}"
+                local socks_link="$link"
+                local tg_link=$(gen_tg_socks_link "$ip_addr" "$link_port" "$username" "$password")
                 echo -e "  ${C}分享链接:${NC}"
                 echo -e "  ${G}$socks_link${NC}"
+                echo ""
+                echo -e "  ${C}Telegram 链接:${NC}"
+                echo -e "  ${G}$tg_link${NC}"
                 echo ""
                 echo -e "  ${C}二维码:${NC}"
                 echo -e "  ${G}$(gen_qr "$socks_link")${NC}"
@@ -10139,7 +10223,11 @@ do_install_server() {
                 esac
             done
             
-            local password=$(head -c $key_len /dev/urandom 2>/dev/null | base64 -w 0)
+            local password
+            password=$(head -c "$key_len" /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\n')
+            if [[ -z "$password" ]]; then
+                password=$(_b64_encode "$(printf '%s%s%s' "$RANDOM" "$RANDOM" "$(date +%s%N 2>/dev/null)" | head -c "$key_len")")
+            fi
             
             echo ""
             _line
@@ -10332,7 +10420,7 @@ do_install_server() {
             ;;
         snell)
             # Snell PSK 需要随机生成
-            local psk=$(head -c 16 /dev/urandom 2>/dev/null | base64 -w 0 | tr -d '/+=' | head -c 22)
+            local psk=$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '/+=' | head -c 22)
             local version="4"
             
             echo ""
@@ -11034,47 +11122,39 @@ parse_trojan_link() {
 parse_ss_link() {
     local link="$1"
     # ss://base64(method:password)@server:port#name
-    # 或 ss://base64(method:password@server:port)#name
+    # 或 ss://method:password@server:port#name / ss://base64(method:password@server:port)#name
     local content="${link#ss://}"
     local name="${content##*#}"
     name=$(printf '%b' "${name//%/\\x}")
     content="${content%%#*}"
+    content="${content%%\?*}"
     
     local server="" port="" method="" password=""
     
     if [[ "$content" == *"@"* ]]; then
-        # 格式: base64@server:port
+        # 格式: base64(method:password)@server:port 或 method:password@server:port
         local encoded="${content%%@*}"
-        local decoded=$(echo "$encoded" | base64 -d 2>/dev/null)
+        local decoded=$(_b64_decode "$encoded")
+        [[ -z "$decoded" && "$encoded" == *":"* ]] && decoded="$encoded"
         if [[ "$decoded" == *":"* ]]; then
             method="${decoded%%:*}"
             password="${decoded#*:}"
         fi
         local server_port="${content#*@}"
-        # 处理 IPv6 地址 [xxxx]:port
-        if [[ "$server_port" == \[*\]:* ]]; then
-            server="${server_port%%]:*}]"
-            port="${server_port##*]:}"
-        else
-            server="${server_port%:*}"
-            port="${server_port##*:}"
-        fi
+        _split_host_port "$server_port"
+        server="$_PARSED_HOST"
+        port="$_PARSED_PORT"
     else
         # 格式: base64(全部)
-        local decoded=$(echo "$content" | base64 -d 2>/dev/null)
+        local decoded=$(_b64_decode "$content")
         if [[ "$decoded" == *"@"* ]]; then
             local method_pass="${decoded%%@*}"
             method="${method_pass%%:*}"
             password="${method_pass#*:}"
             local server_port="${decoded#*@}"
-            # 处理 IPv6 地址 [xxxx]:port
-            if [[ "$server_port" == \[*\]:* ]]; then
-                server="${server_port%%]:*}]"
-                port="${server_port##*]:}"
-            else
-                server="${server_port%:*}"
-                port="${server_port##*:}"
-            fi
+            _split_host_port "$server_port"
+            server="$_PARSED_HOST"
+            port="$_PARSED_PORT"
         fi
     fi
     
@@ -11094,6 +11174,52 @@ parse_ss_link() {
         --arg method "$method" \
         --arg password "$password" \
         '{type:$type,name:$name,server:$server,port:$port,method:$method,password:$password}'
+}
+
+# 解析 socks5:// 链接
+parse_socks_link() {
+    local link="$1"
+    local content="${link#socks5://}"
+    content="${content#socks://}"
+    local name="${content##*#}"
+    name=$(printf '%b' "${name//%/\\x}")
+    [[ -z "$name" || "$name" == "$content" ]] && name="SOCKS5"
+    content="${content%%#*}"
+    content="${content%%\?*}"
+
+    local auth="" server_port="$content"
+    if [[ "$content" == *"@"* ]]; then
+        auth="${content%%@*}"
+        server_port="${content#*@}"
+    fi
+
+    local username="" password=""
+    if [[ -n "$auth" ]]; then
+        username="${auth%%:*}"
+        password="${auth#*:}"
+        username=$(urldecode "$username")
+        password=$(urldecode "$password")
+    fi
+
+    local server="" port=""
+    _split_host_port "$server_port"
+    server="$_PARSED_HOST"
+    port="$_PARSED_PORT"
+
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+
+    jq -nc \
+        --arg type "socks" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg username "$username" \
+        --arg password "$password" \
+        '{type:$type,name:$name,server:$server,port:$port,username:$username,password:$password}'
 }
 
 # 解析 hysteria2:// 链接
@@ -11210,6 +11336,7 @@ parse_share_link() {
         vmess://*) parse_vmess_link "$link" ;;
         trojan://*) parse_trojan_link "$link" ;;
         ss://*) parse_ss_link "$link" ;;
+        socks://*|socks5://*) parse_socks_link "$link" ;;
         hysteria2://*|hy2://*) parse_hy2_link "$link" ;;
         anytls://*) parse_anytls_link "$link" ;;
         *) echo "" ;;
@@ -11244,7 +11371,7 @@ fetch_subscription() {
         local links=""
         local in_proxies=false
         local current_proxy=""
-        local name="" type="" server="" port="" uuid="" password="" method=""
+        local name="" type="" server="" port="" uuid="" password="" method="" username=""
         local network="" tls="" sni="" path="" host="" flow="" pbk="" sid=""
         
         while IFS= read -r line || [[ -n "$line" ]]; do
@@ -11276,14 +11403,21 @@ fetch_subscription() {
                             ;;
                         vmess)
                             local vmess_json="{\"v\":\"2\",\"ps\":\"$name\",\"add\":\"$server\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"${network:-tcp}\",\"type\":\"none\",\"host\":\"$host\",\"path\":\"$path\",\"tls\":\"$([[ "$tls" == "true" ]] && echo "tls" || echo "")\",\"sni\":\"$sni\"}"
-                            links+="vmess://$(echo -n "$vmess_json" | base64 -w 0)"$'\n'
+                            links+="vmess://$(_b64_encode "$vmess_json")"$'\n'
                             ;;
                         trojan)
                             links+="trojan://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
                             ;;
                         ss)
-                            local ss_encoded=$(echo -n "${method}:${password}" | base64 -w 0)
-                            links+="ss://${ss_encoded}@${server}:${port}#$(urlencode "$name")"$'\n'
+                            local ss_encoded=$(_b64_urlsafe_encode "${method}:${password}")
+                            links+="ss://${ss_encoded}@$(_uri_host "$server"):${port}#$(urlencode "$name")"$'\n'
+                            ;;
+                        socks|socks5)
+                            if [[ -n "$username" && -n "$password" ]]; then
+                                links+="socks5://$(urlencode "$username"):$(urlencode "$password")@$(_uri_host "$server"):${port}#$(urlencode "$name")"$'\n'
+                            else
+                                links+="socks5://$(_uri_host "$server"):${port}#$(urlencode "$name")"$'\n'
+                            fi
                             ;;
                         hysteria2)
                             links+="hysteria2://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
@@ -11294,7 +11428,7 @@ fetch_subscription() {
                     esac
                 fi
                 # 重置变量
-                name="" type="" server="" port="" uuid="" password="" method=""
+                name="" type="" server="" port="" uuid="" password="" method="" username=""
                 network="" tls="" sni="" path="" host="" flow="" pbk="" sid=""
                 name=$(echo "$line" | sed 's/.*name:[[:space:]]*"\?\([^"]*\)"\?.*/\1/')
                 continue
@@ -11307,6 +11441,8 @@ fetch_subscription() {
             [[ "$line" =~ ^[[:space:]]*port:[[:space:]]*(.*) ]] && port=$(_strip_quotes "${BASH_REMATCH[1]}")
             [[ "$line" =~ ^[[:space:]]*uuid:[[:space:]]*(.*) ]] && uuid=$(_strip_quotes "${BASH_REMATCH[1]}")
             [[ "$line" =~ ^[[:space:]]*password:[[:space:]]*(.*) ]] && password=$(_strip_quotes "${BASH_REMATCH[1]}")
+            [[ "$line" =~ ^[[:space:]]*username:[[:space:]]*(.*) ]] && username=$(_strip_quotes "${BASH_REMATCH[1]}")
+            [[ "$line" =~ ^[[:space:]]*user:[[:space:]]*(.*) ]] && username=$(_strip_quotes "${BASH_REMATCH[1]}")
             [[ "$line" =~ ^[[:space:]]*cipher:[[:space:]]*(.*) ]] && method=$(_strip_quotes "${BASH_REMATCH[1]}")
             [[ "$line" =~ ^[[:space:]]*network:[[:space:]]*(.*) ]] && network=$(_strip_quotes "${BASH_REMATCH[1]}")
             [[ "$line" =~ ^[[:space:]]*tls:[[:space:]]*(.*) ]] && tls=$(_strip_quotes "${BASH_REMATCH[1]}")
@@ -11331,14 +11467,21 @@ fetch_subscription() {
                     ;;
                 vmess)
                     local vmess_json="{\"v\":\"2\",\"ps\":\"$name\",\"add\":\"$server\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"${network:-tcp}\",\"type\":\"none\",\"host\":\"$host\",\"path\":\"$path\",\"tls\":\"$([[ "$tls" == "true" ]] && echo "tls" || echo "")\",\"sni\":\"$sni\"}"
-                    links+="vmess://$(echo -n "$vmess_json" | base64 -w 0)"$'\n'
+                    links+="vmess://$(_b64_encode "$vmess_json")"$'\n'
                     ;;
                 trojan)
                     links+="trojan://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
                     ;;
                 ss)
-                    local ss_encoded=$(echo -n "${method}:${password}" | base64 -w 0)
-                    links+="ss://${ss_encoded}@${server}:${port}#$(urlencode "$name")"$'\n'
+                    local ss_encoded=$(_b64_urlsafe_encode "${method}:${password}")
+                    links+="ss://${ss_encoded}@$(_uri_host "$server"):${port}#$(urlencode "$name")"$'\n'
+                    ;;
+                socks|socks5)
+                    if [[ -n "$username" && -n "$password" ]]; then
+                        links+="socks5://$(urlencode "$username"):$(urlencode "$password")@$(_uri_host "$server"):${port}#$(urlencode "$name")"$'\n'
+                    else
+                        links+="socks5://$(_uri_host "$server"):${port}#$(urlencode "$name")"$'\n'
+                    fi
                     ;;
                 hysteria2)
                     links+="hysteria2://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
@@ -11552,6 +11695,25 @@ EOF
     udp: true
 EOF
             ;;
+        socks)
+            local username=$(echo "$json" | jq -r '.username // empty')
+            local password=$(echo "$json" | jq -r '.password // empty')
+            cat << EOF
+  - name: "$name"
+    type: socks5
+    server: "$server"
+    port: $port
+EOF
+            if [[ -n "$username" && -n "$password" ]]; then
+                cat << EOF
+    username: "$username"
+    password: "$password"
+EOF
+            fi
+            cat << EOF
+    udp: true
+EOF
+            ;;
         hysteria2)
             local password=$(echo "$json" | jq -r '.password')
             local sni=$(echo "$json" | jq -r '.sni')
@@ -11619,6 +11781,15 @@ external_link_to_surge() {
             local password=$(echo "$json" | jq -r '.password')
             echo "$name = ss, $server, $port, encrypt-method=$method, password=$password"
             ;;
+        socks)
+            local username=$(echo "$json" | jq -r '.username // empty')
+            local password=$(echo "$json" | jq -r '.password // empty')
+            if [[ -n "$username" && -n "$password" ]]; then
+                echo "$name = socks5, $server, $port, username=$username, password=$password, udp-relay=true"
+            else
+                echo "$name = socks5, $server, $port, udp-relay=true"
+            fi
+            ;;
         hysteria2)
             local password=$(echo "$json" | jq -r '.password')
             local sni=$(echo "$json" | jq -r '.sni')
@@ -11637,7 +11808,7 @@ add_external_link() {
     echo ""
     _line
     echo -e "  ${W}添加分享链接${NC}"
-    echo -e "  ${D}支持: vless://, vmess://, trojan://, ss://, hysteria2://, anytls://${NC}"
+    echo -e "  ${D}支持: vless://, vmess://, trojan://, ss://, socks5://, hysteria2://, anytls://${NC}"
     _line
     echo ""
     read -rp "  请输入分享链接: " link
@@ -11990,7 +12161,7 @@ gen_v2ray_sub() {
     [[ -n "$external_links" ]] && links+="$external_links"
     
     # Base64 编码
-    printf '%s' "$links" | base64 -w 0 2>/dev/null || printf '%s' "$links" | base64
+    _b64_encode "$links"
 }
 
 # 生成 Clash 订阅内容
@@ -12158,6 +12329,21 @@ gen_clash_sub() {
     password: $password
     udp: true"
                 ;;
+            socks)
+                if [[ -n "$server_ip" ]]; then
+                    proxy="  - name: \"$name\"
+    type: socks5
+    server: \"$server_ip\"
+    port: $port"
+                    if [[ -n "$username" && -n "$password" ]]; then
+                        proxy+="
+    username: \"$username\"
+    password: \"$password\""
+                    fi
+                    proxy+="
+    udp: true"
+                fi
+                ;;
             hy2)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
     type: hysteria2
@@ -12280,6 +12466,15 @@ gen_surge_sub() {
                 ;;
             ss-legacy)
                 [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
+                ;;
+            socks)
+                if [[ -n "$server_ip" ]]; then
+                    if [[ -n "$username" && -n "$password" ]]; then
+                        proxy="$name = socks5, $server_ip, $port, username=$username, password=$password, udp-relay=true"
+                    else
+                        proxy="$name = socks5, $server_ip, $port, udp-relay=true"
+                    fi
+                fi
                 ;;
             hy2)
                 [[ -n "$server_ip" ]] && proxy="$name = hysteria2, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
