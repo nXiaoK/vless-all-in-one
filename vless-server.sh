@@ -1521,6 +1521,42 @@ gen_sid() {
     fi
 }
 
+gen_reality_keys() {
+    local xray_bin keys privkey pubkey
+    xray_bin=$(_get_xray_x25519_cmd) || return 1
+    keys=$("$xray_bin" x25519 2>/dev/null)
+    [[ -z "$keys" ]] && return 1
+
+    privkey=$(printf '%s\n' "$keys" | awk -F: 'tolower($1) ~ /private[[:space:]_-]*key/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+    pubkey=$(printf '%s\n' "$keys" | awk -F: 'tolower($1) ~ /(public[[:space:]_-]*key|password)/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+
+    [[ -z "$privkey" || -z "$pubkey" ]] && return 1
+    printf '%s|%s\n' "$privkey" "$pubkey"
+}
+
+diagnose_xray_x25519() {
+    local candidate seen="" out
+    _warn "未找到支持 x25519 的 Xray-core"
+    for candidate in /usr/local/bin/xray "$(command -v xray 2>/dev/null)"; do
+        [[ -z "$candidate" || "$seen" == *"|$candidate|"* ]] && continue
+        seen+="|$candidate|"
+        echo -e "  ${D}xray 路径: $candidate${NC}"
+        if [[ ! -x "$candidate" ]]; then
+            echo -e "  ${D}状态: 不可执行或不存在${NC}"
+            continue
+        fi
+        out=$("$candidate" version 2>&1 | head -3)
+        [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/  /'
+        out=$("$candidate" x25519 2>&1)
+        if [[ -n "$out" ]]; then
+            echo -e "  ${D}x25519 输出:${NC}"
+            printf '%s\n' "$out" | sed 's/^/  /'
+        else
+            echo -e "  ${D}x25519 无输出${NC}"
+        fi
+    done
+}
+
 # 证书诊断函数
 diagnose_certificate() {
     local domain="$1"
@@ -3115,15 +3151,61 @@ _install_binary() {
     return 1
 }
 
+_get_xray_x25519_cmd() {
+    local candidate seen="" out
+    for candidate in /usr/local/bin/xray "$(command -v xray 2>/dev/null)"; do
+        [[ -z "$candidate" || "$seen" == *"|$candidate|"* || ! -x "$candidate" ]] && continue
+        seen+="|$candidate|"
+        out=$("$candidate" x25519 2>/dev/null)
+        if printf '%s\n' "$out" | grep -qi 'private.*key' && printf '%s\n' "$out" | grep -Eqi '(public.*key|password)'; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_xray_supports_x25519() {
+    _get_xray_x25519_cmd >/dev/null
+}
+
 install_xray() {
     local xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
         apk add --no-cache gcompat libc6-compat &>/dev/null
     fi
-    _install_binary "xray" "XTLS/Xray-core" \
-        'https://github.com/XTLS/Xray-core/releases/download/v$version/Xray-linux-${xarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context'
+    if _xray_supports_x25519; then
+        _ok "xray 已安装"
+        return 0
+    fi
+
+    _info "安装 Xray-core (获取最新版本)..."
+    local version=$(_get_latest_version "XTLS/Xray-core")
+    [[ -z "$version" ]] && { _err "获取 Xray-core 版本失败"; return 1; }
+
+    local tmp=$(mktemp -d)
+    local url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${xarch}.zip"
+
+    if curl -sLo "$tmp/pkg" --connect-timeout 60 "$url"; then
+        if unzip -oq "$tmp/pkg" -d "$tmp/" && [[ -f "$tmp/xray" ]]; then
+            install -m 755 "$tmp/xray" /usr/local/bin/xray
+            mkdir -p /usr/local/share/xray
+            cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null || true
+            rm -rf "$tmp"
+            fix_selinux_context
+            if _xray_supports_x25519; then
+                _ok "Xray-core v$version 已安装"
+                return 0
+            fi
+            _err "Xray-core 安装后仍不支持 x25519"
+            return 1
+        fi
+    fi
+
+    rm -rf "$tmp"
+    _err "下载 Xray-core 失败"
+    return 1
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -9999,11 +10081,10 @@ do_install_server() {
     case "$protocol" in
         vless)
             local uuid=$(gen_uuid) sid=$(gen_sid)
-            local keys=$(xray x25519 2>/dev/null)
-            [[ -z "$keys" ]] && { _err "密钥生成失败"; return 1; }
-            local privkey=$(echo "$keys" | grep "PrivateKey:" | awk '{print $2}')
-            local pubkey=$(echo "$keys" | grep "Password:" | awk '{print $2}')
-            [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; return 1; }
+            local reality_keys
+            reality_keys=$(gen_reality_keys) || { diagnose_xray_x25519; _err "Reality 密钥生成失败，请确认 xray 支持 x25519 命令"; return 1; }
+            local privkey="${reality_keys%%|*}"
+            local pubkey="${reality_keys#*|}"
             
             # Reality协议不需要证书，直接选择SNI
             echo "" >&2
@@ -10026,11 +10107,10 @@ do_install_server() {
             ;;
         vless-xhttp)
             local uuid=$(gen_uuid) sid=$(gen_sid) path="$(gen_xhttp_path)"
-            local keys=$(xray x25519 2>/dev/null)
-            [[ -z "$keys" ]] && { _err "密钥生成失败"; return 1; }
-            local privkey=$(echo "$keys" | grep "PrivateKey:" | awk '{print $2}')
-            local pubkey=$(echo "$keys" | grep "Password:" | awk '{print $2}')
-            [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; return 1; }
+            local reality_keys
+            reality_keys=$(gen_reality_keys) || { diagnose_xray_x25519; _err "Reality 密钥生成失败，请确认 xray 支持 x25519 命令"; return 1; }
+            local privkey="${reality_keys%%|*}"
+            local pubkey="${reality_keys#*|}"
             
             # Reality+XHTTP协议不需要证书，直接选择SNI
             echo "" >&2
